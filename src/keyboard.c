@@ -12,10 +12,6 @@
 
 /* PS/2 Set 1 make codes consumed by a legacy INT 9/i8042 emulation path. */
 #define SET1_EXTENDED_PREFIX 0xe0
-#define SET1_BREAK_BIT       0x80
-#define SET1_LEFT_CTRL       0x1d
-#define SET1_LEFT_SHIFT      0x2a
-#define SET1_LEFT_ALT        0x38
 #define SET1_ENTER           0x1c
 #define SET1_SPACE           0x39
 #define SET1_ARROW_UP        0x48
@@ -26,9 +22,9 @@
 /*
  * Minimal Set 1 make-code table for letters.  EFI reports text input as a
  * Unicode character, so upper and lower case both map to the same physical key
- * make code.  Uppercase text from Simple Text Input is represented as a
- * left-shift key tap around the letter tap because that protocol does not
- * report modifier press/release state separately.
+ * make code here.  Modifier state (Shift/Caps Lock) is intentionally outside
+ * this small bridge because EFI_SIMPLE_TEXT_INPUT_PROTOCOL only gives us the
+ * resulting character and basic firmware scan code.
  */
 static const uint8_t letter_set1_make_codes[26] = {
     0x1e, /* a */
@@ -62,23 +58,13 @@ static const uint8_t letter_set1_make_codes[26] = {
 /*
  * Single-producer/single-consumer ring buffer of raw scancode bytes.
  * One slot is deliberately kept empty so head == tail means "empty" and the
- * next head equaling tail means "full".  Overflow is non-blocking: complete
- * key sequences are dropped when there is insufficient room, which prevents
- * malformed partial E0-prefixed or make/break pairs from reaching INT 9.
+ * next head equaling tail means "full".  Overflow is non-blocking: new bytes
+ * are dropped and QueuePush() reports false, which keeps firmware polling
+ * simple and avoids dynamic allocation.
  */
 static uint8_t keyboard_queue[KEYBOARD_QUEUE_SIZE];
-static volatile unsigned int keyboard_queue_head;
-static volatile unsigned int keyboard_queue_tail;
-
-static bool modifier_shift_down;
-static bool modifier_ctrl_down;
-static bool modifier_alt_down;
-static bool scancode_down[128];
-
-static void compiler_barrier(void)
-{
-    __asm__ __volatile__("" ::: "memory");
-}
+static unsigned int keyboard_queue_head;
+static unsigned int keyboard_queue_tail;
 
 static unsigned int queue_next(unsigned int index)
 {
@@ -90,130 +76,56 @@ static unsigned int queue_next(unsigned int index)
 
 static unsigned int queue_free_slots(void)
 {
-    unsigned int head = keyboard_queue_head;
-    unsigned int tail = keyboard_queue_tail;
+    if (keyboard_queue_head >= keyboard_queue_tail)
+        return (KEYBOARD_QUEUE_SIZE - 1) -
+               (keyboard_queue_head - keyboard_queue_tail);
 
-    if (head >= tail)
-        return (KEYBOARD_QUEUE_SIZE - 1) - (head - tail);
-
-    return (tail - head) - 1;
+    return (keyboard_queue_tail - keyboard_queue_head) - 1;
 }
 
 bool QueuePush(uint8_t scancode)
 {
-    unsigned int head = keyboard_queue_head;
-    unsigned int next = queue_next(head);
+    unsigned int next = queue_next(keyboard_queue_head);
 
     if (next == keyboard_queue_tail)
         return false;
 
-    keyboard_queue[head] = scancode;
-    compiler_barrier();
+    keyboard_queue[keyboard_queue_head] = scancode;
     keyboard_queue_head = next;
     return true;
 }
 
 bool QueuePop(uint8_t *scancode)
 {
-    unsigned int tail;
-
     if (scancode == NULL)
         return false;
 
-    tail = keyboard_queue_tail;
-    if (keyboard_queue_head == tail)
+    if (keyboard_queue_head == keyboard_queue_tail)
         return false;
 
-    compiler_barrier();
-    *scancode = keyboard_queue[tail];
-    keyboard_queue_tail = queue_next(tail);
+    *scancode = keyboard_queue[keyboard_queue_tail];
+    keyboard_queue_tail = queue_next(keyboard_queue_tail);
     return true;
-}
-
-bool GetNextScancode(uint8_t *out)
-{
-    return QueuePop(out);
 }
 
 void KeyboardQueueReset(void)
 {
     keyboard_queue_head = 0;
     keyboard_queue_tail = 0;
-
-    for (unsigned int i = 0; i < sizeof(scancode_down); i++)
-        scancode_down[i] = false;
-
-    modifier_shift_down = false;
-    modifier_ctrl_down = false;
-    modifier_alt_down = false;
 }
 
-static unsigned int scancode_sequence_len(const struct keyboard_scancode_sequence *seq)
-{
-    if (seq == NULL)
-        return 0;
-
-    return seq->len;
-}
-
-static bool sequence_push_make(const struct keyboard_scancode_sequence *seq)
+static bool sequence_push(const struct keyboard_scancode_sequence *seq)
 {
     if (seq == NULL || seq->len == 0)
         return false;
 
-    if (queue_free_slots() < scancode_sequence_len(seq))
+    /* Keep multi-byte extended key sequences contiguous, or drop them whole. */
+    if (queue_free_slots() < seq->len)
         return false;
 
     for (uint8_t i = 0; i < seq->len; i++)
         QueuePush(seq->bytes[i]);
 
-    return true;
-}
-
-static bool sequence_push_break(const struct keyboard_scancode_sequence *seq)
-{
-    if (seq == NULL || seq->len == 0)
-        return false;
-
-    if (queue_free_slots() < scancode_sequence_len(seq))
-        return false;
-
-    if (seq->len == 1) {
-        QueuePush(seq->bytes[0] | SET1_BREAK_BIT);
-        return true;
-    }
-
-    if (seq->len == 2 && seq->bytes[0] == SET1_EXTENDED_PREFIX) {
-        QueuePush(SET1_EXTENDED_PREFIX);
-        QueuePush(seq->bytes[1] | SET1_BREAK_BIT);
-        return true;
-    }
-
-    return false;
-}
-
-static bool sequence_push_event(const struct keyboard_scancode_sequence *seq,
-                                bool pressed)
-{
-    if (pressed)
-        return sequence_push_make(seq);
-
-    return sequence_push_break(seq);
-}
-
-static bool sequence_push_tap(const struct keyboard_scancode_sequence *seq)
-{
-    unsigned int needed;
-
-    if (seq == NULL || seq->len == 0)
-        return false;
-
-    needed = scancode_sequence_len(seq) * 2;
-    if (queue_free_slots() < needed)
-        return false;
-
-    sequence_push_make(seq);
-    sequence_push_break(seq);
     return true;
 }
 
@@ -232,49 +144,6 @@ static bool set_extended(uint8_t scancode, struct keyboard_scancode_sequence *se
     return true;
 }
 
-static bool set_modifier(bool *state, uint8_t scancode, bool down)
-{
-    struct keyboard_scancode_sequence seq;
-
-    if (*state == down)
-        return true;
-
-    if (queue_free_slots() < 1)
-        return false;
-
-    set_single(scancode, &seq);
-    if (!sequence_push_event(&seq, down))
-        return false;
-
-    *state = down;
-    scancode_down[scancode] = down;
-    return true;
-}
-
-bool KeyboardSetModifierState(bool shift, bool ctrl, bool alt)
-{
-    unsigned int needed = 0;
-
-    if (modifier_shift_down != shift)
-        needed++;
-    if (modifier_ctrl_down != ctrl)
-        needed++;
-    if (modifier_alt_down != alt)
-        needed++;
-
-    if (queue_free_slots() < needed)
-        return false;
-
-    if (!set_modifier(&modifier_ctrl_down, SET1_LEFT_CTRL, ctrl))
-        return false;
-    if (!set_modifier(&modifier_alt_down, SET1_LEFT_ALT, alt))
-        return false;
-    if (!set_modifier(&modifier_shift_down, SET1_LEFT_SHIFT, shift))
-        return false;
-
-    return true;
-}
-
 bool KeyboardTranslateEfiKeyToSet1(const EFI_INPUT_KEY *key,
                                    struct keyboard_scancode_sequence *seq)
 {
@@ -283,11 +152,13 @@ bool KeyboardTranslateEfiKeyToSet1(const EFI_INPUT_KEY *key,
 
     seq->len = 0;
 
-    if (key->UnicodeChar >= L'a' && key->UnicodeChar <= L'z')
+    if (key->UnicodeChar >= L'a' && key->UnicodeChar <= L'z') {
         return set_single(letter_set1_make_codes[key->UnicodeChar - L'a'], seq);
+    }
 
-    if (key->UnicodeChar >= L'A' && key->UnicodeChar <= L'Z')
+    if (key->UnicodeChar >= L'A' && key->UnicodeChar <= L'Z') {
         return set_single(letter_set1_make_codes[key->UnicodeChar - L'A'], seq);
+    }
 
     switch (key->UnicodeChar) {
     case L' ':
@@ -313,53 +184,11 @@ bool KeyboardTranslateEfiKeyToSet1(const EFI_INPUT_KEY *key,
     }
 }
 
-bool KeyboardProcessEfiKeyEvent(const EFI_INPUT_KEY *key, bool pressed)
-{
-    struct keyboard_scancode_sequence seq;
-    uint8_t make_code;
-
-    if (!KeyboardTranslateEfiKeyToSet1(key, &seq))
-        return false;
-
-    make_code = seq.bytes[seq.len - 1];
-    if (make_code >= sizeof(scancode_down))
-        return false;
-
-    if (scancode_down[make_code] == pressed)
-        return true;
-
-    if (!sequence_push_event(&seq, pressed))
-        return false;
-
-    scancode_down[make_code] = pressed;
-    return true;
-}
-
-static bool keyboard_queue_simple_text_key(const EFI_INPUT_KEY *key)
-{
-    struct keyboard_scancode_sequence seq;
-    bool uppercase;
-
-    if (!KeyboardTranslateEfiKeyToSet1(key, &seq))
-        return false;
-
-    uppercase = key->UnicodeChar >= L'A' && key->UnicodeChar <= L'Z';
-    if (!uppercase || modifier_shift_down)
-        return sequence_push_tap(&seq);
-
-    if (queue_free_slots() < 4)
-        return false;
-
-    QueuePush(SET1_LEFT_SHIFT);
-    sequence_push_tap(&seq);
-    QueuePush(SET1_LEFT_SHIFT | SET1_BREAK_BIT);
-    return true;
-}
-
 EFI_STATUS UefiKeyboardPoll(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *con_in)
 {
     EFI_STATUS status;
     EFI_INPUT_KEY key;
+    struct keyboard_scancode_sequence seq;
 
     if (con_in == NULL)
         return EFI_INVALID_PARAMETER;
@@ -371,7 +200,8 @@ EFI_STATUS UefiKeyboardPoll(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *con_in)
         if (EFI_ERROR(status))
             return status;
 
-        keyboard_queue_simple_text_key(&key);
+        if (KeyboardTranslateEfiKeyToSet1(&key, &seq))
+            sequence_push(&seq);
     }
 }
 

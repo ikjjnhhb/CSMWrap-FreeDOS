@@ -12,7 +12,6 @@
  */
 bool QueuePush(uint8_t scancode);
 bool QueuePop(uint8_t *scancode);
-bool GetNextScancode(uint8_t *out);
 void KeyboardQueueReset(void);
 
 struct keyboard_scancode_sequence {
@@ -23,15 +22,6 @@ struct keyboard_scancode_sequence {
 /* Translation layer: EFI key event -> PS/2 Set 1 make-code byte sequence. */
 bool KeyboardTranslateEfiKeyToSet1(const EFI_INPUT_KEY *key,
                                    struct keyboard_scancode_sequence *seq);
-
-/*
- * Optional event-model helpers for callers that can observe real key state
- * (for example through a richer firmware input protocol).  Simple Text Input
- * has no release notification, so UefiKeyboardPoll() emits a make+break tap
- * for each firmware keystroke.
- */
-bool KeyboardProcessEfiKeyEvent(const EFI_INPUT_KEY *key, bool pressed);
-bool KeyboardSetModifierState(bool shift, bool ctrl, bool alt);
 
 /* UEFI input layer: drain all pending firmware key events into the queue. */
 EFI_STATUS UefiKeyboardPoll(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *con_in);
