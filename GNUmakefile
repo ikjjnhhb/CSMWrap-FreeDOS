@@ -306,6 +306,5 @@ src/bins/vgabios.h: GNUmakefile seabios/out/vgabios.bin
 	mkdir -p src/bins
 	cd seabios/out && xxd -i vgabios.bin >../../src/bins/vgabios.h
 
-seabios/.config: GNUmakefile seabios-config
+seabios/.config:
 	cp seabios-config seabios/.config
-	$(call SEABIOS_CALL,olddefconfig)
